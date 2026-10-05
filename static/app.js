@@ -17,6 +17,10 @@ let committedTimer = null;
 // 保证同一时刻只会新建一个实验
 let creatingPromise = null;
 const lastRender = { a: "", b: "" };
+// 最近一次被服务端确认的只读模式（初始 / 新建后为 false）。开关请求失败时
+// 复选框与文案一律恢复到它：请求期间轮询若已带回新确认，就恢复成新值；
+// 期间没有任何新确认，则恢复点击前的旧模式。乐观渲染只改 DOM，不动这里。
+const confirmedReadonly = { a: false, b: false };
 
 const $ = (id) => document.getElementById(id);
 
@@ -163,6 +167,7 @@ async function createExperiment() {
   $("exp-id").textContent = expId;
   for (const side of ["a", "b"]) {
     lastRender[side] = "";
+    confirmedReadonly[side] = false;
     $(`tx-${side}`).textContent = "…";
     $(`dot-${side}`).classList.remove("on");
     $(`read-${side}`).textContent = "—";
@@ -262,7 +267,25 @@ async function refreshCommitted(gen, opts = {}) {
   }
 }
 
+function syncReadonlyDisplay(side, ro) {
+  // 只按给定模式对齐复选框与文案，不碰“最近一次服务端确认”记录。
+  // 程序化设置 checked 不会触发 change 事件，不会形成请求回环。
+  ro = !!ro;
+  const roEl = $("ro-" + side);
+  roEl.textContent = ro ? "开启" : "关闭";
+  roEl.classList.toggle("on", ro);
+  const roToggle = $("ro-toggle-" + side);
+  if (roToggle.checked !== ro) roToggle.checked = ro;
+}
+
 function renderPanel(side, state) {
+  // 只读控件的同步必须先于渲染去重：即使状态 JSON 与上次完全相同，
+  // 也要用服务端模式纠正本地偏差（例如开关请求失败后复选框与文案被
+  // 本地回退、而轮询返回的仍是同一个模式）。
+  const ro = !!state.readonly;
+  confirmedReadonly[side] = ro;
+  syncReadonlyDisplay(side, ro);
+
   const key = JSON.stringify(state);
   if (lastRender[side] === key) return;
   lastRender[side] = key;
@@ -273,15 +296,6 @@ function renderPanel(side, state) {
   dot.classList.toggle("on", inTx);
   dot.title = inTx ? "事务已开启" : "事务未开启";
   $("read-" + side).textContent = state.last_read === null ? "—" : state.last_read;
-
-  // 只读开关状态来自服务端内存：状态轮询同步文案与复选框。
-  // 程序化设置 checked 不会触发 change 事件，不会形成请求回环。
-  const ro = !!state.readonly;
-  const roEl = $("ro-" + side);
-  roEl.textContent = ro ? "开启" : "关闭";
-  roEl.classList.toggle("on", ro);
-  const roToggle = $("ro-toggle-" + side);
-  if (roToggle.checked !== ro) roToggle.checked = ro;
 
   const logEl = $("log-" + side);
   logEl.innerHTML = "";
@@ -415,10 +429,12 @@ function bindPanel(side) {
 async function doSetReadonly(side, enabled) {
   if (creating || expFrozen) return;
   const gen = expGen;
-  const toggle = $("ro-toggle-" + side);
   // 与操作按钮相同：请求未完成时禁用本栏全部控件（含复选框），另一栏不受影响
   setBusy(side, true);
   clearError(side);
+  // 点击后复选框已是新状态（浏览器原生行为）；文案同步到新值，保证请求期间
+  // 勾选与文案一致。这只是乐观渲染，不更新 confirmedReadonly。
+  syncReadonlyDisplay(side, enabled);
   try {
     const data = await fetchJson(
       `/api/experiments/${expId}/conn/${side}/readonly`,
@@ -431,6 +447,7 @@ async function doSetReadonly(side, enabled) {
     if (gen !== expGen) return;
     renderPanel(side, data.state);
     if (!data.ok && data.error) {
+      // 应用层拒绝（模式未变更，状态已由 renderPanel 同步）：错误显示在本栏。
       showError(side, data.error);
     }
   } catch (e) {
@@ -447,9 +464,12 @@ async function doSetReadonly(side, enabled) {
       return;
     }
     if (gen === expGen && !expFrozen) {
-      // 瞬时失败：复选框回退到点击前状态，错误显示在本栏
-      toggle.checked = !enabled;
-      showError(side, { name: null, code: null, message: "请求失败：" + e.message });
+      // 瞬时失败：按最近一次服务端确认的模式同时恢复复选框与文案
+      // （取当前记录而非请求开始时的快照：期间轮询若已确认新模式，
+      // 这里就是新模式；没有任何新确认则是点击前模式），错误显示在
+      // 本栏；之后相同模式的轮询也会再次执行同样的纠正。
+      syncReadonlyDisplay(side, confirmedReadonly[side]);
+      showError(side, { name: null, code: null, message: "只读开关请求失败：" + e.message });
     }
   } finally {
     // 冻结 / 已切换到新实验后，迟到响应不得改动当前控件状态

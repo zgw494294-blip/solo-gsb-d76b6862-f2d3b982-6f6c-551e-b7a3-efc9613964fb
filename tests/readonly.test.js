@@ -241,6 +241,155 @@ async function main() {
     assertEq(ctx.el("ro-toggle-b").checked, false, "冻结复选框保持不勾");
   });
 
+  // 放行一次轮询：状态轮询（本栏只读为 ro）+ 已提交值轮询
+  async function settlePoll(ctx, side, ro) {
+    ctx.tickTimers();
+    await flush();
+    ctx.settle("/OLD/status", 200, {
+      id: "OLD",
+      a: {
+        in_transaction: false,
+        readonly: side === "a" ? ro : false,
+        last_read: null,
+        log: [],
+      },
+      b: {
+        in_transaction: false,
+        readonly: side === "b" ? ro : false,
+        last_read: null,
+        log: [],
+      },
+      checkpoint: { last: null, log: [] },
+    });
+    await flush();
+    ctx.settle("/OLD/committed", 200, { committed: 111 });
+    await flush();
+  }
+
+  // 关键交错：勾选开启 → 请求在途 → 轮询先确认 readonly=true（文案变开启）
+  // → 开关请求失败。失败后复选框与文案必须一致地停在“最近一次服务端确认”
+  // 的模式（开启），错误显示在本栏；随后即使轮询返回完全相同的状态
+  // （JSON 未变、日志 / 读值都没变），本地偏差也能被再次纠正。
+  for (const side of ["a", "b"]) {
+    const other = side === "a" ? "b" : "a";
+    await test(`交错失败：轮询先确认开启后开关请求失败（${side} 栏）`, async () => {
+      const ctx = loadApp("?exp=OLD");
+      await bootOldLive(ctx);
+
+      ctx.el(`ro-toggle-${side}`).change(true);
+      await flush();
+      assertEq(ctx.el(`ro-${side}`).textContent, "开启", "请求中乐观文案为开启");
+      assertEq(ctx.el(`ro-toggle-${side}`).checked, true, "请求中复选框勾选");
+      if (!sideDisabled(ctx, side)) throw new Error("请求期间本栏应禁用");
+      if (!sideEnabled(ctx, other)) throw new Error("请求期间另一栏应可操作");
+      const toggleCall = ctx.findCall(`/OLD/conn/${side}/readonly`, "POST");
+
+      // 轮询先确认：服务端模式已是开启
+      await settlePoll(ctx, side, true);
+      assertEq(ctx.el(`ro-${side}`).textContent, "开启", "轮询确认后文案开启");
+      assertEq(ctx.el(`ro-toggle-${side}`).checked, true, "轮询确认后复选框勾选");
+
+      // 开关请求随后网络失败
+      toggleCall.settled = true;
+      toggleCall.reject(new TypeError("network down"));
+      await flush();
+
+      // 修复前的矛盾：复选框退回关闭、文案仍为开启
+      assertEq(ctx.el(`ro-${side}`).textContent, "开启", "失败后按最近确认恢复：文案开启");
+      assertEq(
+        ctx.el(`ro-toggle-${side}`).checked,
+        true,
+        "失败后按最近确认恢复：复选框勾选，与文案一致"
+      );
+      assertEq(ctx.el(`error-${side}`).hidden, false, "错误显示在本栏");
+      if (!sideEnabled(ctx, side)) throw new Error("失败后本栏恢复可用");
+      if (!sideEnabled(ctx, other)) throw new Error("另一栏始终可操作");
+
+      // 人为制造本地偏差（修复前相同状态轮询无法纠正）：同模式轮询应纠正
+      ctx.el(`ro-toggle-${side}`).checked = false;
+      ctx.el(`ro-${side}`).textContent = "关闭";
+      await settlePoll(ctx, side, true);
+      assertEq(
+        ctx.el(`ro-toggle-${side}`).checked,
+        true,
+        "相同状态轮询也能把复选框纠正回开启"
+      );
+      assertEq(ctx.el(`ro-${side}`).textContent, "开启", "相同状态轮询把文案纠正回开启");
+    });
+  }
+
+  // 失败时期间没有新确认：恢复原已确认模式（两栏各覆盖 开启→取消 与 关闭→勾选）
+  const rollbackCases = [
+    { side: "a", confirmed: true, attempt: false },
+    { side: "b", confirmed: false, attempt: true },
+  ];
+  for (const c of rollbackCases) {
+    await test(
+      `无新确认的失败回退：${c.side} 栏已确认${c.confirmed ? "开启" : "关闭"}，` +
+        `尝试${c.attempt ? "开启" : "关闭"}失败后恢复`,
+      async () => {
+        const ctx = loadApp("?exp=OLD");
+        await bootOldLive(ctx);
+
+        // 先用一次轮询把本栏带到“已确认模式”
+        await settlePoll(ctx, c.side, c.confirmed);
+        assertEq(ctx.el(`ro-${c.side}`).textContent, c.confirmed ? "开启" : "关闭", "前置文案");
+        assertEq(
+          ctx.el(`ro-toggle-${c.side}`).checked,
+          c.confirmed,
+          "前置复选框"
+        );
+
+        ctx.el(`ro-toggle-${c.side}`).change(c.attempt);
+        await flush();
+        assertEq(
+          ctx.el(`ro-${c.side}`).textContent,
+          c.attempt ? "开启" : "关闭",
+          "请求期间文案与勾选一致（乐观）"
+        );
+        // 请求期间不放行任何轮询：没有新的服务端确认
+        const toggleCall = ctx.findCall(`/OLD/conn/${c.side}/readonly`, "POST");
+        assertEq(
+          toggleCall.body,
+          JSON.stringify({ enabled: c.attempt }),
+          "请求体为目标布尔值"
+        );
+        toggleCall.settled = true;
+        toggleCall.reject(new TypeError("network down"));
+        await flush();
+
+        // 恢复点击前的已确认模式，勾选与文案一致
+        assertEq(
+          ctx.el(`ro-toggle-${c.side}`).checked,
+          c.confirmed,
+          "失败后复选框恢复原已确认模式"
+        );
+        assertEq(
+          ctx.el(`ro-${c.side}`).textContent,
+          c.confirmed ? "开启" : "关闭",
+          "失败后文案恢复原已确认模式，与复选框一致"
+        );
+        assertEq(ctx.el(`error-${c.side}`).hidden, false, "错误显示在本栏");
+        if (!sideEnabled(ctx, c.side)) throw new Error("失败后本栏恢复可用");
+
+        // 相同状态轮询（仍是原模式）同样能纠正本地偏差
+        ctx.el(`ro-toggle-${c.side}`).checked = c.attempt;
+        ctx.el(`ro-${c.side}`).textContent = c.attempt ? "开启" : "关闭";
+        await settlePoll(ctx, c.side, c.confirmed);
+        assertEq(
+          ctx.el(`ro-toggle-${c.side}`).checked,
+          c.confirmed,
+          "相同状态轮询纠正复选框"
+        );
+        assertEq(
+          ctx.el(`ro-${c.side}`).textContent,
+          c.confirmed ? "开启" : "关闭",
+          "相同状态轮询纠正文案"
+        );
+      }
+    );
+  }
+
   console.log(`\n${passed} 通过，${failed} 失败`);
   process.exit(failed === 0 ? 0 : 1);
 }
