@@ -17,6 +17,12 @@ let committedTimer = null;
 // 保证同一时刻只会新建一个实验
 let creatingPromise = null;
 const lastRender = { a: "", b: "" };
+// confirmedRo：每栏「最近一次被服务端确认」的只读模式。
+// 来源仅限服务端确认过的状态：开关请求的 2xx 响应与状态轮询。
+// 开关请求失败（网络错误 / 非 2xx）时，复选框与文案都恢复到此模式，
+// 因此在途轮询若已确认过新模式，失败也按新模式恢复；在途没有新确认时
+// 自然恢复为点击前的原已确认模式。初始 false 会被首次 status 立即校准。
+const confirmedRo = { a: false, b: false };
 
 const $ = (id) => document.getElementById(id);
 
@@ -163,6 +169,7 @@ async function createExperiment() {
   $("exp-id").textContent = expId;
   for (const side of ["a", "b"]) {
     lastRender[side] = "";
+    confirmedRo[side] = false;
     $(`tx-${side}`).textContent = "…";
     $(`dot-${side}`).classList.remove("on");
     $(`read-${side}`).textContent = "—";
@@ -262,7 +269,28 @@ async function refreshCommitted(gen, opts = {}) {
   }
 }
 
+// 把某栏的只读文案、样式与复选框统一到给定（服务端确认过的）模式。
+// 程序化设置 checked 不会触发 change 事件，不会形成请求回环。
+// 不依赖状态其余字段是否变化：即便轮询返回与上次完全相同的状态，
+// 也必须再次调用，以纠正本地勾选 / 文案与服务端不一致的偏差。
+function syncReadonlyView(side, ro) {
+  const roEl = $("ro-" + side);
+  roEl.textContent = ro ? "开启" : "关闭";
+  roEl.classList.toggle("on", ro);
+  const roToggle = $("ro-toggle-" + side);
+  if (roToggle.checked !== ro) roToggle.checked = ro;
+}
+
 function renderPanel(side, state) {
+  // 只读模式是本函数唯一需要「同状态也强制纠正」的字段：
+  // 复选框会先于请求结果变化（用户点击即翻转），请求失败或在途交错都可能
+  // 让本地勾选 / 文案偏离服务端；必须在去重短路之前先记录并校准，
+  // 这样即使服务端返回与上次完全相同的状态（无日志 / 读值变化），
+  // 也能把勾选与文案重新拉回一致，无须等待日志或读值变化。
+  const ro = !!state.readonly;
+  confirmedRo[side] = ro;
+  syncReadonlyView(side, ro);
+
   const key = JSON.stringify(state);
   if (lastRender[side] === key) return;
   lastRender[side] = key;
@@ -273,15 +301,6 @@ function renderPanel(side, state) {
   dot.classList.toggle("on", inTx);
   dot.title = inTx ? "事务已开启" : "事务未开启";
   $("read-" + side).textContent = state.last_read === null ? "—" : state.last_read;
-
-  // 只读开关状态来自服务端内存：状态轮询同步文案与复选框。
-  // 程序化设置 checked 不会触发 change 事件，不会形成请求回环。
-  const ro = !!state.readonly;
-  const roEl = $("ro-" + side);
-  roEl.textContent = ro ? "开启" : "关闭";
-  roEl.classList.toggle("on", ro);
-  const roToggle = $("ro-toggle-" + side);
-  if (roToggle.checked !== ro) roToggle.checked = ro;
 
   const logEl = $("log-" + side);
   logEl.innerHTML = "";
@@ -406,7 +425,8 @@ function bindPanel(side) {
     btn.addEventListener("click", () => doOp(side, btn.dataset.op));
   }
   // 只读开关：每栏独立，遵守与该栏操作相同的「请求期间禁用本栏」规则。
-  // 点击时复选框已是新状态；失败 / 410 / 冻结 / 迟到都按服务端状态回退。
+  // 点击时复选框已是新状态；失败时复选框与文案统一恢复到最近一次服务端
+  // 确认的模式（在途轮询确认过新模式就按新模式，否则按原模式）。
   $("ro-toggle-" + side).addEventListener("change", (ev) => {
     doSetReadonly(side, ev.target.checked).catch(() => {});
   });
@@ -415,7 +435,6 @@ function bindPanel(side) {
 async function doSetReadonly(side, enabled) {
   if (creating || expFrozen) return;
   const gen = expGen;
-  const toggle = $("ro-toggle-" + side);
   // 与操作按钮相同：请求未完成时禁用本栏全部控件（含复选框），另一栏不受影响
   setBusy(side, true);
   clearError(side);
@@ -447,8 +466,12 @@ async function doSetReadonly(side, enabled) {
       return;
     }
     if (gen === expGen && !expFrozen) {
-      // 瞬时失败：复选框回退到点击前状态，错误显示在本栏
-      toggle.checked = !enabled;
+      // 瞬时失败：错误显示在本栏；复选框与文案统一恢复到「最近一次服务端
+      // 确认的模式」——在途轮询若已确认新模式（confirmedRo 已更新），则按
+      // 新模式恢复；没有新确认时 confirmedRo 仍是点击前的原模式，即回退原状。
+      // 不能只翻复选框：否则会出现复选框关闭、文案仍为开启的矛盾，且相同
+      // 状态的后续轮询会被去重短路，永远无法纠正文案。
+      syncReadonlyView(side, confirmedRo[side]);
       showError(side, { name: null, code: null, message: "请求失败：" + e.message });
     }
   } finally {

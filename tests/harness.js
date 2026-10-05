@@ -130,6 +130,18 @@ function loadApp(search = "") {
     get(id);
   }
 
+  // 与 index.html 一致：删除提示与各错误框初始带 hidden 属性。
+  // （必须在元素都创建后统一设置：面板初始化时部分元素已被提前 get 创建。）
+  for (const id of [
+    "deleted-note",
+    "error-exp",
+    "error-a",
+    "error-b",
+    "error-ckpt",
+  ]) {
+    elements.get(id).hidden = true;
+  }
+
   const selectorMap = {
     "#panel-a button, #panel-a input": [
       ...opButtons.a,
